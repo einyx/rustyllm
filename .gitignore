@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+.venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+# Per-machine benchmark/output artefacts (regeneratable)
+/bench_*.md
+/legacy/airllm/.git/
+legacy/

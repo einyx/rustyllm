@@ -1,0 +1,106 @@
+[package]
+name = "rustyllm"
+version = "0.1.0"
+edition = "2021"
+description = "Layer-wise LLM inference in Rust — run large models on limited GPU memory"
+license = "Apache-2.0"
+repository = "https://github.com/alessio/rustyllm"
+readme = "README.md"
+
+[features]
+default = []
+# GPU backends. Enable at most one per build. Linux/CUDA hosts pick
+# `cuda`; macOS hosts pick `metal`.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# Intel MKL for parallel CPU matmul (requires intel-mkl apt package).
+# Massive win on multi-core hosts that don't have CUDA; saturates all
+# cores via OpenMP without our `parallel-cpu` shim.
+mkl = ["candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+# Swap the StreamingLlama (Llama-family) block's projections from
+# `candle_nn::Linear` to the rayon-parallel `ParallelLinear` shim.
+# ~4x faster CPU matmul on 32-core hosts. Off by default because the
+# extra rayon scheduling can be counterproductive on small machines.
+# Mixtral / ChatGLM / Baichuan blocks always use ParallelLinear.
+parallel-cpu = []
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.21"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+half = "2"
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rustyllm-shard"
+path = "src/bin/shard.rs"
+
+[[bin]]
+name = "rustyllm-quantize-shards"
+path = "src/bin/quantize_shards.rs"
+
+[[example]]
+name = "smoke_inference"
+path = "examples/smoke_inference.rs"
+
+[[example]]
+name = "smoke_inference_70b"
+path = "examples/smoke_inference_70b.rs"
+
+[[example]]
+name = "smoke_streaming"
+path = "examples/smoke_streaming.rs"
+
+[[example]]
+name = "smoke_streaming_70b"
+path = "examples/smoke_streaming_70b.rs"
+
+[[example]]
+name = "bench_streaming_70b"
+path = "examples/bench_streaming_70b.rs"
+
+[[example]]
+name = "bench_parallel_linear"
+path = "examples/bench_parallel_linear.rs"
+
+[[example]]
+name = "bench_q4_kernel"
+path = "examples/bench_q4_kernel.rs"
+
+[[example]]
+name = "async_h2d_spike"
+path = "examples/async_h2d_spike.rs"
+
+[[example]]
+name = "async_h2d_phase2"
+path = "examples/async_h2d_phase2.rs"
+
+[[example]]
+name = "async_h2d_phase3"
+path = "examples/async_h2d_phase3.rs"
+
+[[example]]
+name = "bench_streaming_70b_async"
+path = "examples/bench_streaming_70b_async.rs"
+
+[[example]]
+name = "bench_streaming_70b_q4"
+path = "examples/bench_streaming_70b_q4.rs"
+
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
