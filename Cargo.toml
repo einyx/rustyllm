@@ -41,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
 half = "2"
 memmap2 = "0.9"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -104,3 +105,7 @@ path = "examples/bench_streaming_70b_q4.rs"
 [[example]]
 name = "generate"
 path = "examples/generate.rs"
+
+[[example]]
+name = "quantize_and_free"
+path = "examples/quantize_and_free.rs"

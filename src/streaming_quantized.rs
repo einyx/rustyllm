@@ -645,11 +645,56 @@ impl StreamingLlamaQuantized {
         }
 
         let stream_start = self.resident_blocks.len() + self.cpu_resident_blocks.len();
-        for (offset, path) in self.layer_files[stream_start..].iter().enumerate() {
+        let streamed: Vec<std::path::PathBuf> = self.layer_files[stream_start..].to_vec();
+
+        // Optional single-worker prefetcher: while compute runs on layer N,
+        // a background thread walks layer N+1 through the OS buffer cache
+        // (chunked read, drop data) so the next GgufLayer::open hits warm
+        // pages. Off by default because on RAM-tight hosts (e.g. 36 GB Mac
+        // running 70B-Q4) the page cache can't shed cold layers fast enough
+        // and the prefetch racing ahead can OOM-kill the process. Enable
+        // explicitly with `RUSTYLLM_PREFETCH=1` on hosts with headroom.
+        let worker_handle = if std::env::var("RUSTYLLM_PREFETCH").as_deref() == Ok("1") {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<std::path::PathBuf>(1);
+            let worker = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = vec![0u8; 8 * 1024 * 1024];
+                while let Ok(path) = rx.recv() {
+                    if let Ok(mut f) = std::fs::File::open(&path) {
+                        loop {
+                            match f.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                }
+            });
+            if let Some(first) = streamed.first() {
+                let _ = tx.send(first.clone());
+            }
+            Some((tx, worker))
+        } else {
+            None
+        };
+
+        for (offset, path) in streamed.iter().enumerate() {
             let i = stream_start + offset;
+
+            if let Some((tx, _)) = worker_handle.as_ref() {
+                if offset + 1 < streamed.len() {
+                    let _ = tx.send(streamed[offset + 1].clone());
+                }
+            }
+
             let mut layer = GgufLayer::open(path, &self.device)?;
             let block = QBlock::load(&mut layer, i, &self.cfg)?;
             x = block.forward(&x, index_pos, i, cache)?;
+        }
+
+        if let Some((tx, worker)) = worker_handle {
+            drop(tx);
+            let _ = worker.join();
         }
 
         Ok(x)

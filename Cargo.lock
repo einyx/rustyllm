@@ -2583,6 +2583,7 @@ dependencies = [
  "clap",
  "half",
  "hf-hub",
+ "libc",
  "memmap2",
  "rayon",
  "safetensors 0.4.5",
