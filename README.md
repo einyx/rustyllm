@@ -118,7 +118,49 @@ Platypus2-70B-instruct, 16 tokens greedy, prompt `"What is the capital of the Un
 
 7B F16 (~14 GB) exceeds 12 GB VRAM, so all-GPU residency isn't possible on this card; would need ≥16 GB device.
 
-All rustyllm runs produce output byte-identical to the F16 reference continuation.
+### 70B on Apple Silicon (M3 Pro, 36 GB unified)
+
+Tighter budget than the Linux box: 36 GB has to hold model + activations + draft + OS. No discrete VRAM ceiling (Metal allocations come out of the same pool as host RAM), but the total is the constraint. Same Platypus2-70B-instruct, same prompt, same 7B draft.
+
+| Configuration                                                  | Quant   | tok/s | Notes |
+|---|---|---:|---|
+| **Spec K=12, Q2K target + 40 layers pinned**                   | Q2_K    | **0.240** | best speed; "Anacostia" answer (also valid) |
+| Spec K=12, Q3K-MLP/Q4K-attn target + 40 pin                    | mixed   | 0.187 | "Potomac" — better answer, ~22 % slower |
+| Spec K=12, Q4K target streamed                                 | Q4_K    | 0.115 | baseline-quality, no pinning needed |
+| Q4K streamed (no spec)                                         | Q4_K    | 0.033 | baseline |
+| 7B Q4K fully resident (reference for "fast Metal")             | Q4_K    | 18.65 | proves Metal kernels are fast when weights fit |
+
+**The Apple-Silicon-specific finding:** spec decoding with an aggressively-quantized target works even when the target wouldn't free-generate well alone. Q2K-70B alone produces garbage ("Theʎʎʎʎʎʎ…"), but as the *verifier* it just argmax-checks the 7B draft's proposals — and Q2K's argmax mostly agrees with Q4K's on common-vocabulary completions. Quality varies by prompt type:
+
+| Prompt type      | Q2K target tok/s | accept rate | quality vs Q4K target |
+|---|---:|---:|---|
+| Factual lookup    | 0.240            | 44 %        | equivalent (different but valid completions) |
+| Reasoning         | 0.159            | 23 %        | worse — Q2K argmax wobble shortens answers |
+| Code generation   | 0.124            | 19 %        | equivalent (both struggle; base model is mediocre at code) |
+
+Use Q2K target when speed > nuance (factual chat, lookup tools). Use Q4K target when you need full quality (reasoning, long-form).
+
+Recipe (assumes both shard sets prepared via `ensure_q4_shards`):
+
+```bash
+RUSTYLLM_TARGET_DIR=~/.cache/rustyllm/q4_shards/garage-bAInd_Platypus2-70B-instruct_q2k \
+RUSTYLLM_DRAFT_DIR=~/.cache/rustyllm/q4_shards/garage-bAInd_Platypus2-7B_q4k \
+RUSTYLLM_TARGET_GPU=40 RUSTYLLM_SPEC_K=12 RUSTYLLM_MAX_TOKENS=64 \
+  cargo run --release --features metal --example spec_decode_70b
+```
+
+To produce a custom mixed-quant target (attn Q4K + MLP Q3K, ~30 GB) from existing Q4K shards without re-downloading 140 GB of F16:
+
+```bash
+RUSTYLLM_SRC_DIR=~/.cache/rustyllm/q4_shards/garage-bAInd_Platypus2-70B-instruct_q4k \
+RUSTYLLM_DST_DIR=~/.cache/rustyllm/q4_shards/garage-bAInd_Platypus2-70B-instruct_attnq4_mlpq3 \
+RUSTYLLM_ATTN_QUANT=q4k RUSTYLLM_MLP_QUANT=q3k \
+  cargo run --release --example requantize_mixed
+```
+
+Output of Q2K-target and Q3K-MLP-target spec runs is *not* byte-identical to Q4K — the verifier itself is a lossier model — but the speculative-decoding contract still holds: every committed token is target's argmax at that position. So output equals what greedy Q2K (or Q3K-MLP) target would produce on its own.
+
+All other rustyllm runs (Q4K and above) produce output byte-identical to the F16 reference continuation.
 
 **Speculative decoding** (`examples/spec_decode_70b.rs`): a small Llama-2-7B "draft" model proposes K tokens, the full 70B "target" verifies them in a single batched forward. The verifier is always the target, so output is mathematically identical to greedy decoding. **Adaptive K** (default): start at K=2, drop K when accept rate falls below 40% (eventually to K=0 = pure baseline), grow back when it recovers. This way speculation never meaningfully regresses on unpredictable prompts:
 
