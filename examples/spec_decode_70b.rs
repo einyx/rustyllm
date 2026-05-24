@@ -19,7 +19,7 @@
 //! Target output is mathematically identical to greedy decoding without
 //! speculation — the verifier is always the target model.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -89,7 +89,10 @@ fn main() -> Result<()> {
         ..LoadOptions::default()
     };
 
-    println!("Loading target {TARGET_MODEL} from {}...", target_dir());
+    // Use eprintln throughout so progress shows up in real time when stdout
+    // is redirected to a file. Rust's stdout is block-buffered (4 KB) when
+    // not a TTY, which hides println output for long-running benches.
+    eprintln!("Loading target {TARGET_MODEL} from {}...", target_dir());
     let t0 = Instant::now();
     let mut target = StreamingLlamaQuantized::from_pretrained(
         TARGET_MODEL,
@@ -113,9 +116,9 @@ fn main() -> Result<()> {
     if target_cpu > 0 {
         target.pin_cpu_resident_layers(target_cpu)?;
     }
-    println!("  target loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!("  target loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    println!("Loading draft {DRAFT_MODEL} from {}...", draft_dir());
+    eprintln!("Loading draft {DRAFT_MODEL} from {}...", draft_dir());
     let t0 = Instant::now();
     let mut draft = StreamingLlamaQuantized::from_pretrained(
         DRAFT_MODEL,
@@ -131,7 +134,7 @@ fn main() -> Result<()> {
     if draft_gpu < 32 {
         draft.pin_cpu_resident_layers(32 - draft_gpu)?;
     }
-    println!("  draft loaded in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!("  draft loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     let prompt_str = prompt();
     let max_tokens = max_new_tokens();
@@ -159,7 +162,7 @@ fn main() -> Result<()> {
     )?;
 
     // Prefill both models on the prompt (one forward each).
-    println!("Prefilling prompt ({prompt_len} tokens)...");
+    eprintln!("Prefilling prompt ({prompt_len} tokens)...");
     let prefill = Tensor::new(&tokens[..], &target_device)?.unsqueeze(0)?;
     let target_prefill_logits = target.forward(&prefill, 0, &mut t_cache)?;
     let _ = draft.forward(&prefill, 0, &mut d_cache)?;
@@ -180,20 +183,19 @@ fn main() -> Result<()> {
     let win_size = 4usize;
     let mut recent: std::collections::VecDeque<(usize, usize)> =
         std::collections::VecDeque::with_capacity(win_size);
-    println!(
+    eprintln!(
         "Generating up to {max_tokens} tokens with K={k_max} speculative (adaptive={adaptive})..."
     );
     print!("\n>>> ");
     // Stream the prompt's "last_token" so the user sees something before
     // the first target verify finishes. Decoded against the full token
     // history so SentencePiece word-boundary markers resolve correctly.
-    let mut emitted_chars = 0usize;
     let first_chunk = tokenizer
         .decode(&tokens[prompt_len..], false)
         .unwrap_or_default();
     print!("{first_chunk}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    emitted_chars = first_chunk.len();
+    let mut emitted_chars = first_chunk.len();
     let t_gen = Instant::now();
     let mut accepted_total = 0usize;
     let mut target_forwards = 0usize;
