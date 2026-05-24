@@ -28,8 +28,14 @@ use rustyllm::inference::LoadOptions;
 use rustyllm::streaming_quantized::QuantStreamCache;
 use rustyllm::StreamingLlamaQuantized;
 
-const TARGET_MODEL: &str = "garage-bAInd/Platypus2-70B-instruct";
-const DRAFT_MODEL: &str = "garage-bAInd/Platypus2-7B";
+const DEFAULT_TARGET_MODEL: &str = "garage-bAInd/Platypus2-70B-instruct";
+const DEFAULT_DRAFT_MODEL: &str = "garage-bAInd/Platypus2-7B";
+fn target_model() -> String {
+    std::env::var("RUSTYLLM_TARGET_MODEL").unwrap_or_else(|_| DEFAULT_TARGET_MODEL.to_string())
+}
+fn draft_model() -> String {
+    std::env::var("RUSTYLLM_DRAFT_MODEL").unwrap_or_else(|_| DEFAULT_DRAFT_MODEL.to_string())
+}
 fn cache_root() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     format!("{home}/.cache/rustyllm/q4_shards")
@@ -92,10 +98,11 @@ fn main() -> Result<()> {
     // Use eprintln throughout so progress shows up in real time when stdout
     // is redirected to a file. Rust's stdout is block-buffered (4 KB) when
     // not a TTY, which hides println output for long-running benches.
-    eprintln!("Loading target {TARGET_MODEL} from {}...", target_dir());
+    let tm = target_model();
+    eprintln!("Loading target {tm} from {}...", target_dir());
     let t0 = Instant::now();
     let mut target = StreamingLlamaQuantized::from_pretrained(
-        TARGET_MODEL,
+        &tm,
         Path::new(target_dir().as_str()),
         target_opts,
     )?;
@@ -118,10 +125,11 @@ fn main() -> Result<()> {
     }
     eprintln!("  target loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    eprintln!("Loading draft {DRAFT_MODEL} from {}...", draft_dir());
+    let dm = draft_model();
+    eprintln!("Loading draft {dm} from {}...", draft_dir());
     let t0 = Instant::now();
     let mut draft = StreamingLlamaQuantized::from_pretrained(
-        DRAFT_MODEL,
+        &dm,
         Path::new(draft_dir().as_str()),
         draft_opts,
     )?;
