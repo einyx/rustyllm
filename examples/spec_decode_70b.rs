@@ -30,13 +30,17 @@ use rustyllm::StreamingLlamaQuantized;
 
 const TARGET_MODEL: &str = "garage-bAInd/Platypus2-70B-instruct";
 const DRAFT_MODEL: &str = "garage-bAInd/Platypus2-7B";
-const TARGET_Q4_DIR_DEFAULT: &str = "/mnt/4t/cache/airllm_splits_q4k";
-const DRAFT_Q4_DIR_DEFAULT: &str = "/mnt/4t/cache/platypus2_7b_q4k";
+fn cache_root() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{home}/.cache/rustyllm/q4_shards")
+}
 fn target_dir() -> String {
-    std::env::var("RUSTYLLM_TARGET_DIR").unwrap_or_else(|_| TARGET_Q4_DIR_DEFAULT.to_string())
+    std::env::var("RUSTYLLM_TARGET_DIR")
+        .unwrap_or_else(|_| format!("{}/garage-bAInd_Platypus2-70B-instruct_q4k", cache_root()))
 }
 fn draft_dir() -> String {
-    std::env::var("RUSTYLLM_DRAFT_DIR").unwrap_or_else(|_| DRAFT_Q4_DIR_DEFAULT.to_string())
+    std::env::var("RUSTYLLM_DRAFT_DIR")
+        .unwrap_or_else(|_| format!("{}/garage-bAInd_Platypus2-7B_q4k", cache_root()))
 }
 const DEFAULT_PROMPT: &str = "What is the capital of the United States, and what river runs through it?";
 const DEFAULT_MAX_NEW_TOKENS: usize = 16;
@@ -71,12 +75,17 @@ fn argmax_last(logits: &Tensor) -> Result<u32> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Share a single device instance across target + draft. Each call to
+    // best_available_device() returns a fresh Device, and candle treats
+    // distinct instances as different devices even when they back the
+    // same physical GPU — leading to "device mismatch" on cross-model ops.
+    let shared_device = rustyllm::inference::best_available_device();
     let target_opts = LoadOptions {
-        layer_shards_dir: Some(PathBuf::from("/mnt/4t/cache/airllm_splits")),
+        device: shared_device.clone(),
         ..LoadOptions::default()
     };
     let draft_opts = LoadOptions {
-        layer_shards_dir: None,
+        device: shared_device.clone(),
         ..LoadOptions::default()
     };
 
@@ -87,13 +96,23 @@ fn main() -> Result<()> {
         Path::new(target_dir().as_str()),
         target_opts,
     )?;
-    // Target: 8 GPU layers (~4.8 GB) leaves room for draft fully on GPU.
+    // Defaults tuned for 36 GB Mac (M3 Pro): pin 0 on device, 0 in CPU
+    // resident → everything streams from disk. Override via env when you
+    // have more headroom (e.g. RUSTYLLM_TARGET_CPU=30 on a 64 GB host).
     let target_gpu = std::env::var("RUSTYLLM_TARGET_GPU")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8usize);
-    target.pin_resident_layers(target_gpu)?;
-    target.pin_cpu_resident_layers(80 - target_gpu)?;
+        .unwrap_or(0usize);
+    let target_cpu = std::env::var("RUSTYLLM_TARGET_CPU")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0usize);
+    if target_gpu > 0 {
+        target.pin_resident_layers(target_gpu)?;
+    }
+    if target_cpu > 0 {
+        target.pin_cpu_resident_layers(target_cpu)?;
+    }
     println!("  target loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     println!("Loading draft {DRAFT_MODEL} from {}...", draft_dir());
@@ -103,7 +122,7 @@ fn main() -> Result<()> {
         Path::new(draft_dir().as_str()),
         draft_opts,
     )?;
-    // 7B has 32 layers. Pin all on GPU when there's headroom (~3.8 GB).
+    // 7B Q4 is only ~4 GB — fits fully resident even on tight hosts.
     let draft_gpu = std::env::var("RUSTYLLM_DRAFT_GPU")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -125,7 +144,7 @@ fn main() -> Result<()> {
 
     let target_cfg = target.config().clone();
     let draft_cfg = draft.config().clone();
-    let target_device = candle_core::Device::cuda_if_available(0)?;
+    let target_device = shared_device.clone();
     let mut t_cache = QuantStreamCache::new(
         true,
         candle_core::DType::F32,
