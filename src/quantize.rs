@@ -152,6 +152,156 @@ pub fn quantize_shard(src: &Path, dst: &Path, quant: Quantization) -> Result<Qua
     Ok(report)
 }
 
+/// Classifies a tensor by role for mixed-quantization policies.
+/// Used by [`requantize_shard_mixed`] to apply different bit-depths
+/// to attention vs MLP weights — attention is more quality-sensitive
+/// per parameter, MLPs dominate parameter count, so giving attention
+/// higher precision and MLP lower precision is the standard recipe
+/// for fitting big models in tight memory budgets.
+#[derive(Debug, Clone, Copy)]
+pub enum TensorRole {
+    /// Stays F16 (norms, embeddings, lm_head, biases).
+    KeepF16,
+    /// Attention weights — q/k/v/o projections, dense (ChatGLM), W_pack (Baichuan).
+    Attention,
+    /// MLP / feed-forward weights — gate/up/down projections, dense_h_to_4h, etc.
+    Mlp,
+    /// Other quantizable weights — fallback bucket.
+    Other,
+}
+
+fn classify_tensor(name: &str) -> TensorRole {
+    if !should_quantize(name) {
+        return TensorRole::KeepF16;
+    }
+    // Attention markers across the families we support.
+    if name.contains(".self_attn.")
+        || name.contains(".self_attention.")
+        || name.contains(".attention.")
+        || name.contains(".attn.")
+        // Baichuan combined QKV
+        || name.contains(".W_pack.")
+    {
+        return TensorRole::Attention;
+    }
+    // MLP markers.
+    if name.contains(".mlp.")
+        || name.contains("dense_h_to_4h")
+        || name.contains("dense_4h_to_h")
+        || name.contains(".feed_forward.")
+    {
+        return TensorRole::Mlp;
+    }
+    TensorRole::Other
+}
+
+/// Re-quantize an existing per-layer GGUF into a new GGUF using
+/// different quantization formats for attention vs MLP weights.
+/// Reads `src` (typically already Q4K), dequantizes each tensor to
+/// F16, then re-quantizes per the role policy.
+///
+/// Skips work if `dst` already exists (idempotent for restart safety).
+///
+/// Note on quality: re-quantizing from already-quantized weights
+/// (Q4K → F16 → Q2K for MLPs) loses slightly more than going from
+/// raw F16 directly. In practice Q4K is close enough to F16 that the
+/// double-dequantize penalty is small compared to the Q2K floor.
+pub fn requantize_shard_mixed(
+    src: &Path,
+    dst: &Path,
+    attn_quant: Quantization,
+    mlp_quant: Quantization,
+    other_quant: Quantization,
+) -> Result<QuantizeReport> {
+    if dst.exists() {
+        // Best-effort report: caller can re-stat sizes if needed.
+        return Ok(QuantizeReport {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            total: 0,
+            quantized: 0,
+            kept_f16: 0,
+        });
+    }
+
+    let mut src_file = File::open(src)?;
+    let content = gguf_file::Content::read(&mut src_file)?;
+
+    let mut q_tensors: Vec<(String, QTensor)> = Vec::with_capacity(content.tensor_infos.len());
+    let mut report = QuantizeReport {
+        src: src.to_path_buf(),
+        dst: dst.to_path_buf(),
+        total: 0,
+        quantized: 0,
+        kept_f16: 0,
+    };
+
+    // Snapshot the tensor names so we can iterate without holding a
+    // borrow into content.tensor_infos.
+    let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+    for name in names {
+        report.total += 1;
+        let qt = content
+            .tensor(&mut src_file, &name, &Device::Cpu)
+            .map_err(|e| Error::Msg(format!("gguf read {name}: {e}")))?;
+        let dequant = qt
+            .dequantize(&Device::Cpu)
+            .map_err(|e| Error::Msg(format!("dequantize {name}: {e}")))?;
+
+        let role = classify_tensor(&name);
+        let new_qt = match role {
+            TensorRole::KeepF16 => {
+                report.kept_f16 += 1;
+                QTensor::quantize(&dequant, GgmlDType::F16)?
+            }
+            TensorRole::Attention => {
+                if dequant.dims().len() == 2
+                    && dequant.dim(dequant.dims().len() - 1)? % quant_block_size(attn_quant) == 0
+                {
+                    report.quantized += 1;
+                    QTensor::quantize(&dequant, attn_quant.as_ggml())?
+                } else {
+                    report.kept_f16 += 1;
+                    QTensor::quantize(&dequant, GgmlDType::F16)?
+                }
+            }
+            TensorRole::Mlp => {
+                if dequant.dims().len() == 2
+                    && dequant.dim(dequant.dims().len() - 1)? % quant_block_size(mlp_quant) == 0
+                {
+                    report.quantized += 1;
+                    QTensor::quantize(&dequant, mlp_quant.as_ggml())?
+                } else {
+                    report.kept_f16 += 1;
+                    QTensor::quantize(&dequant, GgmlDType::F16)?
+                }
+            }
+            TensorRole::Other => {
+                if dequant.dims().len() == 2
+                    && dequant.dim(dequant.dims().len() - 1)? % quant_block_size(other_quant) == 0
+                {
+                    report.quantized += 1;
+                    QTensor::quantize(&dequant, other_quant.as_ggml())?
+                } else {
+                    report.kept_f16 += 1;
+                    QTensor::quantize(&dequant, GgmlDType::F16)?
+                }
+            }
+        };
+        q_tensors.push((name, new_qt));
+    }
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut w = File::create(dst)?;
+    let metadata: [(&str, &gguf_file::Value); 0] = [];
+    let tensor_refs: Vec<(&str, &QTensor)> =
+        q_tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    gguf_file::write(&mut w, &metadata, &tensor_refs)?;
+    Ok(report)
+}
+
 /// Quantize every `.safetensors` shard in `src_dir` into matching
 /// `.gguf` files in `dst_dir`, preserving the per-layer naming.
 pub fn quantize_split_directory(

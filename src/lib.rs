@@ -24,7 +24,10 @@ pub use error::{Error, Result};
 pub use family::Family;
 pub use inference::LayeredLlama;
 pub use prepare::{ensure_q4_shards, quantize_and_delete_f16, PrepareOptions};
-pub use quantize::{quantize_shard, quantize_split_directory, Quantization, QuantizeReport};
+pub use quantize::{
+    quantize_shard, quantize_split_directory, requantize_shard_mixed, Quantization,
+    QuantizeReport, TensorRole,
+};
 pub use shard::{shard_model, ShardConfig, ShardPaths};
 pub use streaming::{StreamCache, StreamingLlama};
 pub use streaming_family::StreamingFamily;

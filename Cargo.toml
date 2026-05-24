@@ -109,3 +109,7 @@ path = "examples/generate.rs"
 [[example]]
 name = "quantize_and_free"
 path = "examples/quantize_and_free.rs"
+
+[[example]]
+name = "requantize_mixed"
+path = "examples/requantize_mixed.rs"

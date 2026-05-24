@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,29 +28,43 @@ use candle_transformers::utils::repeat_kv;
 
 use crate::error::{Error, Result};
 
-/// Per-layer GGUF reader. Caches metadata (`Content`) once at
-/// construction; tensor data is read on demand via `tensor(name)`.
+/// Per-layer GGUF reader. Slurps the whole file into a buffer at
+/// construction so all subsequent tensor reads are zero-syscall in-
+/// memory slices. On RAM-tight hosts this is offset by an explicit
+/// `release_buffer()` after weights are copied into device memory.
+///
+/// Why slurp + Cursor (vs File + seek): GGUF tensor data is laid out
+/// roughly sequentially in the file, but the gguf reader issues
+/// individual seek+read calls per tensor (~9 per layer for Q4K). Each
+/// seek can break SSD read-ahead, dropping effective throughput. One
+/// big sequential read uses the SSD's full bandwidth, then random-
+/// access slicing on the in-memory buffer is free.
 pub(crate) struct GgufLayer {
     content: gguf_file::Content,
-    file: File,
+    buffer: Vec<u8>,
     device: Device,
 }
 
 impl GgufLayer {
     pub(crate) fn open(path: &Path, device: &Device) -> Result<Self> {
         let mut file = File::open(path)?;
-        let content = gguf_file::Content::read(&mut file)?;
+        let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        let mut buffer = Vec::with_capacity(len);
+        file.read_to_end(&mut buffer)?;
+        let mut cursor = Cursor::new(&buffer[..]);
+        let content = gguf_file::Content::read(&mut cursor)?;
         Ok(Self {
             content,
-            file,
+            buffer,
             device: device.clone(),
         })
     }
 
     fn qmatmul(&mut self, name: &str) -> Result<QMatMul> {
+        let mut cursor = Cursor::new(&self.buffer[..]);
         let qt = self
             .content
-            .tensor(&mut self.file, name, &self.device)
+            .tensor(&mut cursor, name, &self.device)
             .map_err(|e| Error::Msg(format!("gguf tensor {name}: {e}")))?;
         Ok(QMatMul::from_arc(Arc::new(qt))?)
     }
@@ -57,11 +72,21 @@ impl GgufLayer {
     /// Dequantize a tensor (used for norms / embeddings stored as F16
     /// inside the GGUF).
     fn tensor(&mut self, name: &str) -> Result<Tensor> {
+        let mut cursor = Cursor::new(&self.buffer[..]);
         let qt = self
             .content
-            .tensor(&mut self.file, name, &self.device)
+            .tensor(&mut cursor, name, &self.device)
             .map_err(|e| Error::Msg(format!("gguf tensor {name}: {e}")))?;
         Ok(qt.dequantize(&self.device)?)
+    }
+
+    /// Free the in-memory buffer. Call after all tensors have been
+    /// loaded (QBlock holds owned tensor data, so the buffer is no
+    /// longer referenced). Releases ~500 MB per layer back to the
+    /// allocator immediately, keeping peak RSS bounded during the
+    /// streaming forward.
+    pub(crate) fn release_buffer(&mut self) {
+        self.buffer = Vec::new();
     }
 }
 
@@ -689,6 +714,9 @@ impl StreamingLlamaQuantized {
 
             let mut layer = GgufLayer::open(path, &self.device)?;
             let block = QBlock::load(&mut layer, i, &self.cfg)?;
+            // Block now owns the tensor data; drop the file buffer so
+            // peak RSS doesn't grow by ~500 MB per layer across the loop.
+            layer.release_buffer();
             x = block.forward(&x, index_pos, i, cache)?;
         }
 
