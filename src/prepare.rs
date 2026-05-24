@@ -159,10 +159,46 @@ pub fn shard_quantize_streaming(
             .or_insert_with(|| checkpoint_dir.join(file));
     }
 
+    // Precompute which layers need each shard file. Lets us delete the
+    // F16 input file once we've passed its last referencing layer —
+    // critical when /tmp/<model>/ holds ~131 GB and disk is tight.
+    // Enabled with RUSTYLLM_DELETE_F16_INPUTS=1; off by default so the
+    // checkpoint stays usable for re-runs.
+    let delete_inputs = std::env::var("RUSTYLLM_DELETE_F16_INPUTS").as_deref() == Ok("1");
+    let mut last_use: HashMap<String, usize> = HashMap::new();
+    if delete_inputs {
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let layer_dot = format!("{layer}.");
+            for (name, file) in weight_map.iter() {
+                if name.starts_with(&layer_dot) || *name == *layer {
+                    if let Some(f) = file.as_str() {
+                        last_use
+                            .entry(f.to_string())
+                            .and_modify(|v| {
+                                if layer_idx > *v {
+                                    *v = layer_idx;
+                                }
+                            })
+                            .or_insert(layer_idx);
+                    }
+                }
+            }
+        }
+    }
+
     let mut produced = 0usize;
-    for layer in &layers {
+    for (layer_idx, layer) in layers.iter().enumerate() {
         let gguf_path = q4_dir.join(format!("{layer}.gguf"));
         if gguf_path.exists() {
+            // Still need to advance progressive-delete bookkeeping so a
+            // restarted run frees the same files.
+            if delete_inputs {
+                progressive_delete_inputs(
+                    layer_idx,
+                    &last_use,
+                    &shard_files,
+                );
+            }
             continue;
         }
 
@@ -204,8 +240,36 @@ pub fn shard_quantize_streaming(
         crate::quantize::quantize_shard(&f16_out, &gguf_path, quant)?;
         fs::remove_file(&f16_out)?;
         produced += 1;
+
+        // After fully consuming this layer, any input shard whose last
+        // referencing layer is <= current index is no longer needed.
+        if delete_inputs {
+            progressive_delete_inputs(layer_idx, &last_use, &shard_files);
+        }
     }
     Ok(produced)
+}
+
+/// Delete input safetensors files whose last referencing layer index is
+/// <= `current_layer`. Called after each layer finishes when
+/// `RUSTYLLM_DELETE_F16_INPUTS=1`.
+fn progressive_delete_inputs(
+    current_layer: usize,
+    last_use: &std::collections::HashMap<String, usize>,
+    shard_files: &std::collections::HashMap<String, PathBuf>,
+) {
+    for (file, &last) in last_use {
+        if last == current_layer {
+            if let Some(path) = shard_files.get(file) {
+                if path.exists() {
+                    match std::fs::remove_file(path) {
+                        Ok(_) => eprintln!("[stream] freed {}", path.display()),
+                        Err(e) => eprintln!("[stream] could not free {}: {e}", path.display()),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Quantize every F16 shard in `f16_dir` to GGUF under `q4_dir`, deleting
